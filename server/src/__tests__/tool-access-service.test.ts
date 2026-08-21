@@ -7140,6 +7140,25 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(audits).toHaveLength(2);
     expect(audits.every((audit) => audit.actorType === "user" && audit.actorId === member.userId)).toBe(true);
   });
+
+  it("removes orphaned agent installs during replacement", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const service = toolAccessService(db);
+    await service.putConnectionInstalls(connection.id, {
+      installs: [{ targetType: "agent", targetId: agent.id }],
+    });
+    await db.delete(agents).where(eq(agents.id, agent.id));
+
+    const response = await request(createRouteApp(db))
+      .put(`/api/tool-connections/${connection.id}/installs`)
+      .send({ installs: [] });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ connectionId: connection.id, installs: [] });
+    await expect(db.select().from(toolConnectionInstalls)).resolves.toEqual([]);
+  });
 });
 
 describe("classifyRisk", () => {

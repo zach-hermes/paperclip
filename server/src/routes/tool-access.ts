@@ -733,12 +733,16 @@ export function toolAccessRoutes(
             .map((install) => install.targetId),
         )];
         for (const agentId of changedAgentIds) {
+          const installKey = `agent:${agentId}`;
           const [agent] = await db
             .select({ id: agents.id, companyId: agents.companyId })
             .from(agents)
             .where(and(eq(agents.id, agentId), eq(agents.companyId, connection.companyId)))
             .limit(1);
-          if (!agent) throw forbidden("The target agent is not available in this company");
+          if (!agent) {
+            if (!requestedKeys.has(installKey)) continue;
+            throw forbidden("The target agent is not available in this company");
+          }
           const decision = await access.decide({
             actor: req.actor,
             action: "agent_config:update",
