@@ -7283,6 +7283,41 @@ registerCurrentRoute({
 });
 
 registerCurrentRoute({
+  method: "put",
+  path: "/api/tool-connections/{connectionId}/grants/{grantId}/members",
+  tags: ["tool-access"],
+  summary: "Replace the member audience of a tool connection grant",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/tool-connections/{connectionId}/services",
+  tags: ["tool-access"],
+  summary: "List the broker services behind a tool connection",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/tool-connections/{connectionId}/services/{toolkitSlug}/connect",
+  tags: ["tool-access"],
+  summary: "Start a broker service connection for a toolkit",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/tool-connections/{connectionId}/services/{toolkitSlug}/status",
+  tags: ["tool-access"],
+  summary: "Poll the connection status of a broker service",
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/tool-connections/{connectionId}/services/{toolkitSlug}",
+  tags: ["tool-access"],
+  summary: "Disconnect a broker service from a tool connection",
+});
+
+registerCurrentRoute({
   method: "get",
   path: "/api/tool-connections/{connectionId}/installs",
   tags: ["tool-access"],
@@ -7385,6 +7420,13 @@ registerCurrentRoute({
   path: "/api/tools/oauth/callback",
   tags: ["tool-access"],
   summary: "Handle a tool app OAuth callback",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/tools/oauth/paperclip-id/callback",
+  tags: ["tool-access"],
+  summary: "Handle a brokered Paperclip ID OAuth callback",
 });
 
 registerCurrentRoute({

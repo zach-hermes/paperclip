@@ -8271,6 +8271,66 @@ describeEmbeddedPostgres("tool access service", () => {
     ]));
   });
 
+  it("removes the install-derived binding when an agent is uninstalled, and keeps an operator-authored one", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const other = await createAgent(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const app = createRouteApp(db, undefined, createToolGatewayService(db, {
+      toolActionSigningSecret: "test-secret",
+    }));
+
+    await request(app)
+      .put(`/api/tool-connections/${connection.id}/installs`)
+      .send({ installs: [{ targetType: "agent", targetId: agent.id }] })
+      .expect(200);
+
+    const [profile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(eq(toolProfiles.profileKey, `app:${connection.id}`));
+    expect(profile).toBeDefined();
+
+    const bindingsFor = async (targetId: string) => db
+      .select()
+      .from(toolProfileBindings)
+      .where(and(
+        eq(toolProfileBindings.profileId, profile!.id),
+        eq(toolProfileBindings.targetType, "agent"),
+        eq(toolProfileBindings.targetId, targetId),
+      ));
+
+    expect(await bindingsFor(agent.id)).toHaveLength(1);
+
+    // A binding the operator authored through the access model, not through an
+    // install. Uninstalling must not touch it.
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: profile!.id,
+      targetType: "agent",
+      targetId: other.id,
+      priority: 100,
+      metadata: { source: "operator" },
+    });
+
+    await request(app)
+      .put(`/api/tool-connections/${connection.id}/installs`)
+      .send({ installs: [] })
+      .expect(200);
+
+    // The install row is gone, so the agent can no longer reach the connection.
+    expect(await db.select().from(toolConnectionInstalls)
+      .where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
+    // The binding the install created is gone too, so the permission state cannot
+    // report an agent the operator already removed.
+    expect(await bindingsFor(agent.id)).toHaveLength(0);
+    // The operator-authored binding survives.
+    expect(await bindingsFor(other.id)).toHaveLength(1);
+
+    const effective = await createTestToolAccessService(db).getEffectiveProfilesForAgent(company.id, agent.id);
+    expect(effective.installedConnections.map((item) => item.id)).not.toContain(connection.id);
+  });
+
   it("limits connection configuration to the creator or a manager with role defaults", async () => {
     const company = await createCompany(db);
     const creator = boardSessionActor(company.id, "member", `creator-${randomUUID()}`);

@@ -9335,10 +9335,43 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             eq(toolConnectionInstalls.connectionId, connection.id),
           ));
         const existingKeys = new Set(existing.map((install) => `${install.targetType}:${install.targetId}`));
-        const removeIds = existing
-          .filter((install) => !requested.has(`${install.targetType}:${install.targetId}`))
-          .map((install) => install.id);
-        if (removeIds.length > 0) await tx.delete(toolConnectionInstalls).where(inArray(toolConnectionInstalls.id, removeIds));
+        const removals = existing
+          .filter((install) => !requested.has(`${install.targetType}:${install.targetId}`));
+        const removeIds = removals.map((install) => install.id);
+        if (removeIds.length > 0) {
+          await tx.delete(toolConnectionInstalls).where(inArray(toolConnectionInstalls.id, removeIds));
+          // Uninstalling must also drop the binding this path created. Installing
+          // writes both an install row and a profile binding, so deleting only the
+          // install row leaves a binding that no surface can see or remove. The
+          // install row is the reach gate (`mintConnectionTokenForAgent` fails with
+          // `installation_required`, and the heartbeat only hands over installed
+          // connections), so a stale binding grants no reach on its own — but it
+          // still makes `finishApp`, which rebuilds `access` from the bindings,
+          // read a target the operator already removed.
+          //
+          // Only bindings tagged `source: "tool_connection_install"` are removed.
+          // A binding the operator authored through the access model carries a
+          // different source and must survive an uninstall.
+          const [installProfile] = await tx
+            .select({ id: toolProfiles.id })
+            .from(toolProfiles)
+            .where(and(
+              eq(toolProfiles.companyId, connection.companyId),
+              eq(toolProfiles.profileKey, `app:${connection.id}`),
+            ))
+            .limit(1);
+          if (installProfile) {
+            for (const install of removals) {
+              await tx.delete(toolProfileBindings).where(and(
+                eq(toolProfileBindings.companyId, connection.companyId),
+                eq(toolProfileBindings.profileId, installProfile.id),
+                eq(toolProfileBindings.targetType, install.targetType),
+                eq(toolProfileBindings.targetId, install.targetId),
+                sql`${toolProfileBindings.metadata}->>'source' = 'tool_connection_install'`,
+              ));
+            }
+          }
+        }
         const additions = [...requested.entries()].filter(([key]) => !existingKeys.has(key)).map(([, install]) => install);
         if (additions.length > 0) {
           await tx.insert(toolConnectionInstalls).values(additions.map((install) => ({
