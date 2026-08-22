@@ -3251,7 +3251,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .where(eq(issues.id, input.issueId))
         .for("update")
         .then((rows) => rows[0] ?? null);
-      if (!current || current.status !== input.expectedStatus) return null;
+      if (
+        !current ||
+        (current.status !== input.expectedStatus && current.status !== "blocked")
+      ) return null;
 
       return issuesSvc.update(input.issueId, {
         status: "blocked",
