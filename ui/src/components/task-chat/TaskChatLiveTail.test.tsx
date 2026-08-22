@@ -59,7 +59,7 @@ describe("TaskChatLiveTail", () => {
     expect(container.textContent).toContain("src/app.ts");
   });
 
-  it("renders a tool's diff inset", () => {
+  it("keeps tool diff bodies out of the activity feed", () => {
     const items = parse([
       { kind: "tool_call", ts: TS, name: "Edit", toolUseId: "t1", input: { file_path: "a.ts" } },
       { kind: "diff", ts: TS, changeType: "add", text: "const x = 1;" },
@@ -69,8 +69,16 @@ describe("TaskChatLiveTail", () => {
 
     const phaseSummary = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-phase-summary"]');
     expect(phaseSummary?.getAttribute("aria-expanded")).toBe("true");
-    expect(container.textContent).toContain("const x = 1;");
+    expect(container.textContent).not.toContain("const x = 1;");
+    expect(container.textContent).not.toContain("+1 −1");
+
+    const tool = container.querySelector<HTMLButtonElement>(".tc-enter-tool button");
+    expect(tool).not.toBeNull();
+    flushSync(() => tool?.click());
+
     expect(container.textContent).toContain("+1 −1");
+    expect(container.textContent).not.toContain("const x = 1;");
+    expect(container.querySelector('[data-testid="task-chat-tool-change-summary"]')).not.toBeNull();
   });
 
   it("drops the debug plumbing kinds RunTranscriptView surfaced", () => {

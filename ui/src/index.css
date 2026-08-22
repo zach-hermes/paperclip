@@ -2291,6 +2291,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
 :root {
   --gtc-1: 56px 56px 24px minmax(0,1fr); /* Extracted from ui/src/components/DocumentDiffModal.tsx (grid-cols-[56px_56px_24px_minmax(0,1fr)]). */
   --gtc-case-revisions: 16rem 1fr; /* Extracted from ui/src/components/CaseRevisionRail.tsx (grid-cols-[16rem_1fr]). */
+  --gtc-task-chat-details: 6rem minmax(0,1fr);
   --gtc-2: auto minmax(0,1fr) 2.25rem; /* Extracted from ui/src/components/FileTree.tsx (grid-cols-[auto_minmax(0,1fr)_2.25rem]). */
   --gtc-3: minmax(0,1fr) 2.25rem; /* Extracted from ui/src/components/FileTree.tsx (grid-cols-[minmax(0,1fr)_2.25rem]). */
   --gtc-4: minmax(0,1fr); /* Extracted from ui/src/components/FileTree.tsx (grid-cols-[minmax(0,1fr)]). */

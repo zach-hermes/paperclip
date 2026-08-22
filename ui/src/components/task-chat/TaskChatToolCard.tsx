@@ -21,14 +21,14 @@ const STATUS_ICON = {
 /**
  * Tool invocation as a flat activity row (v7): [glyph] [name] [mono target] …
  * [hover chevron] [status]. No card chrome — activity is metadata, not
- * content. Clicking toggles the mono result/detail block (left-rail inset);
- * diffs render as an inset panel below the row.
+ * content. Clicking toggles a compact result/change summary (left-rail
+ * inset). Full diff bodies stay out of the activity feed.
  */
 export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
   const { Icon, spin, tone } = STATUS_ICON[item.status];
   const RowIcon = toolTaxonomy(item.rawName ?? item.name).icon;
   const [showDetail, setShowDetail] = useState(false);
-  const expandable = Boolean(item.detail);
+  const expandable = Boolean(item.detail || item.diff);
 
   return (
     <div className="tc-enter-tool flex flex-col text-xs">
@@ -70,35 +70,20 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
           <Icon className={cn("h-3.5 w-3.5", tone, spin && "animate-spin")} aria-hidden />
         </span>
       </button>
-      {expandable && showDetail ? (
+      {item.detail && showDetail ? (
         <pre className="ml-2.5 mt-0.5 overflow-x-auto whitespace-pre-wrap border-l-2 border-border py-1 pl-2.5 font-mono text-(length:--text-micro) leading-relaxed text-muted-foreground">
           {item.detail}
         </pre>
       ) : null}
-      {item.diff ? (
-        <div className="tc-reveal-diff ml-2.5 mt-1 border-l-2 border-border pl-2.5">
-          <div className="mb-1 flex items-center gap-2 text-(length:--text-micro) text-muted-foreground">
-            {item.diff.path ? <span className="truncate font-mono">{item.diff.path}</span> : null}
-            <span className="ml-auto shrink-0 font-mono font-semibold">
+      {item.diff && showDetail ? (
+        <div className="ml-2.5 mt-0.5 border-l-2 border-border py-1 pl-2.5" data-testid="task-chat-tool-change-summary">
+          <div className="flex min-w-0 items-center gap-2 text-(length:--text-micro) text-muted-foreground">
+            <span className="shrink-0">Changed</span>
+            {item.diff.path ? <span className="min-w-0 truncate font-mono text-foreground">{item.diff.path}</span> : null}
+            <span className="ml-auto shrink-0 font-mono">
               +{item.diff.added} −{item.diff.removed}
             </span>
           </div>
-          {item.diff.lines?.length ? (
-            <pre className="overflow-x-auto rounded-sm bg-muted/50 p-2 text-(length:--text-micro) leading-relaxed">
-              {item.diff.lines.map((l, i) => (
-                <div
-                  key={i}
-                  className={cn(
-                    l.kind === "add" && "text-(--status-task-icon-done)",
-                    l.kind === "remove" && "text-destructive",
-                    l.kind === "context" && "text-muted-foreground",
-                  )}
-                >
-                  {l.kind === "add" ? "+" : l.kind === "remove" ? "−" : " "} {l.text}
-                </div>
-              ))}
-            </pre>
-          ) : null}
         </div>
       ) : null}
     </div>

@@ -234,6 +234,40 @@ const allProviderActivity: TaskChatItem[] = [
   providerActivity("provider_notice", "provider.notice.recorded", "informational", { summary: "Throughput temporarily reduced" }),
 ];
 
+const searchResultsAndFileChanges: TaskChatItem[] = [
+  providerActivity("research", "research.completed", "completed", {
+    summary: "site:nextjs.org/docs/app/api-reference/config/eslint Next.js 16 eslint.config.mjs core-web-vitals typescript",
+    details: [
+      { label: "Action", value: "search" },
+      { label: "Status", value: "completed" },
+      { label: "Query", value: "site:nextjs.org/docs/app/api-reference/config/eslint Next.js 16 eslint.config.mjs core-web-vitals typescript", mono: true },
+    ],
+    links: [
+      { label: "Configuration: ESLint | Next.js", href: "https://nextjs.org/docs/app/api-reference/config/eslint", description: "Configure ESLint in the App Router and understand the current defaults." },
+      { label: "next.config.js: eslint | Next.js", href: "https://nextjs.org/docs/pages/api-reference/config/next-config-js/eslint", description: "Legacy configuration behavior and migration notes." },
+      { label: "Configuration: TypeScript | Next.js", href: "https://nextjs.org/docs/app/api-reference/config/typescript", description: "TypeScript configuration options for modern Next.js applications." },
+      { label: "Upgrading: Codemods | Next.js", href: "https://nextjs.org/docs/app/guides/upgrading/codemods", description: "Automated migrations for eslint.config.mjs and current conventions." },
+      { label: "API Reference: Configuration | Next.js", href: "https://nextjs.org/docs/app/api-reference/config", description: "The complete application configuration reference." },
+      { label: "Next.js 16 upgrade guide", href: "https://nextjs.org/docs/app/guides/upgrading/version-16", description: "Breaking changes and recommended upgrade steps for version 16." },
+      { label: "Core Web Vitals", href: "https://nextjs.org/docs/app/api-reference/functions/use-report-web-vitals", description: "Measure and report application performance metrics." },
+    ],
+  }),
+  {
+    id: "file-change-search-story",
+    kind: "tool",
+    name: "File change",
+    rawName: "file_change",
+    target: "/Users/runner/workspaces/example/tsconfig.json",
+    status: "completed",
+    diff: {
+      path: "tsconfig.json",
+      added: 228,
+      removed: 0,
+      lines: Array.from({ length: 24 }, (_, index) => ({ kind: "add" as const, text: `generated diff line ${index + 1}` })),
+    },
+  },
+];
+
 function RunnerTransitionStory() {
   const [phase, setPhase] = useState(0);
   const items: TaskChatItem[] = phase === 0
@@ -451,6 +485,28 @@ export const RunnerLiveAllProviderFamilies: Story = {
     if (!planRow) throw new Error("Plan activity row did not render");
     await userEvent.click(within(planRow).getByRole("button"));
     await expect(within(planRow).getByRole("list", { name: "Plan steps" })).toBeInTheDocument();
+  },
+};
+
+export const RunnerLiveSearchResultsAndFileChanges: Story = {
+  name: "Runner Activity / Live / Search Results and File Changes",
+  render: () => <RunnerTurnStory items={searchResultsAndFileChanges} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByRole("button", { name: /expand run activity/i }));
+    const list = canvas.getByTestId("task-chat-runner-activity-list");
+    const researchRow = list.querySelector<HTMLElement>('[data-activity-family="research"]');
+    if (!researchRow) throw new Error("Research activity row did not render");
+    await userEvent.click(within(researchRow).getByRole("button"));
+    const toolRow = Array.from(list.querySelectorAll<HTMLElement>(".tc-enter-tool")).find((row) => row.textContent?.includes("File change"));
+    if (!toolRow) throw new Error("File change tool row did not render");
+    await userEvent.click(within(toolRow).getByRole("button"));
+
+    await expect(canvas.getByTestId("task-chat-research-query")).toHaveTextContent("eslint.config.mjs");
+    await expect(canvas.getByRole("list", { name: "Research sources" }).querySelectorAll("li")).toHaveLength(5);
+    await expect(canvas.getByText("Show 2 more results")).toBeVisible();
+    await expect(canvas.getByTestId("task-chat-tool-change-summary")).toHaveTextContent("+228 −0");
+    await expect(canvas.queryByText("generated diff line 1")).not.toBeInTheDocument();
   },
 };
 

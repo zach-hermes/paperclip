@@ -11,6 +11,7 @@ import { MarkdownBody } from "@/components/MarkdownBody";
 import { WorkspaceFileLink } from "@/components/WorkspaceFileLink";
 import { cn } from "@/lib/utils";
 import type {
+  TaskChatProtocolDetail,
   TaskChatProtocolItem,
   TaskChatProtocolStep,
   TaskChatProviderActivityItem,
@@ -22,6 +23,9 @@ import {
   protocolActivityLabel,
   protocolActivityPresentation,
 } from "./task-chat-activity-presentation";
+
+const COMPACT_RESEARCH_RESULT_LIMIT = 5;
+const COMPACT_WORKSPACE_FILE_LIMIT = 8;
 
 function StatusIcon({ status }: { status: "running" | "completed" | "failed" | "interrupted" | "informational" }) {
   if (status === "running") return <Loader2 className="h-3.5 w-3.5 animate-spin text-(--status-agent-running)" aria-hidden />;
@@ -37,7 +41,91 @@ function stepStatusIcon(status: TaskChatProtocolStep["status"]) {
   return <Circle className="h-3 w-3 text-muted-foreground" aria-hidden />;
 }
 
+function DetailList({ details }: { details: readonly TaskChatProtocolDetail[] }) {
+  if (details.length === 0) return null;
+  return (
+    <dl className="flex min-w-0 flex-col gap-1.5" data-testid="task-chat-provider-detail-list">
+      {details.map((detail) => (
+        <div className="grid min-w-0 grid-cols-1 gap-0.5 sm:grid-cols-(--gtc-task-chat-details) sm:gap-3" key={`${detail.label}:${detail.value}`}>
+          <dt className="text-muted-foreground">{detail.label}</dt>
+          <dd className={cn("min-w-0 break-words text-foreground", detail.mono && "font-mono")}>{detail.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function sourceHostname(href: string): string {
+  try {
+    return new URL(href).hostname.replace(/^www\./, "");
+  } catch {
+    return href;
+  }
+}
+
+function ResearchDetails({ item }: { item: TaskChatProviderActivityItem }) {
+  const [showAllResults, setShowAllResults] = useState(false);
+  const query = item.details.find((detail) => detail.label.toLowerCase() === "query");
+  const additionalDetails = item.details.filter((detail) => !["action", "query", "status"].includes(detail.label.toLowerCase()));
+  const visibleLinks = showAllResults ? item.links : item.links.slice(0, COMPACT_RESEARCH_RESULT_LIMIT);
+  const hiddenResultCount = item.links.length - visibleLinks.length;
+
+  return (
+    <div className="flex min-w-0 flex-col gap-2.5">
+      {query ? (
+        <div className="min-w-0 rounded-sm bg-muted/40 px-2.5 py-2" data-testid="task-chat-research-query">
+          <p className="text-(length:--text-nano) font-medium uppercase tracking-wide text-muted-foreground">Query</p>
+          <p className="mt-0.5 min-w-0 break-words font-mono text-(length:--text-micro) text-foreground">{query.value}</p>
+        </div>
+      ) : null}
+      {item.links.length > 0 ? (
+        <div className="min-w-0">
+          <p className="mb-1 text-(length:--text-nano) font-medium uppercase tracking-wide text-muted-foreground">
+            {item.links.length} {item.links.length === 1 ? "result" : "results"}
+          </p>
+          <ol className="divide-y divide-border/60" aria-label="Research sources">
+            {visibleLinks.map((link, index) => (
+              <li className="min-w-0 py-1.5 first:pt-0 last:pb-0" key={`${link.href}:${index}`}>
+                <a className="flex min-w-0 items-center gap-1 font-medium text-foreground hover:underline" href={link.href} target="_blank" rel="noreferrer">
+                  <span className="truncate">{link.label}</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
+                </a>
+                <p className="mt-0.5 flex min-w-0 gap-2 text-muted-foreground">
+                  <span className="shrink-0">{sourceHostname(link.href)}</span>
+                  {link.description ? <span className="min-w-0 truncate">{link.description}</span> : null}
+                </p>
+              </li>
+            ))}
+          </ol>
+          {hiddenResultCount > 0 ? (
+            <button
+              type="button"
+              className="mt-1.5 text-muted-foreground hover:text-foreground"
+              onClick={() => setShowAllResults(true)}
+            >
+              Show {hiddenResultCount} more {hiddenResultCount === 1 ? "result" : "results"}
+            </button>
+          ) : showAllResults && item.links.length > COMPACT_RESEARCH_RESULT_LIMIT ? (
+            <button
+              type="button"
+              className="mt-1.5 text-muted-foreground hover:text-foreground"
+              onClick={() => setShowAllResults(false)}
+            >
+              Show fewer results
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      <DetailList details={additionalDetails} />
+      {item.output || item.outputTruncated ? (
+        <p className="text-muted-foreground">Additional provider output is available in Runner Inspector.</p>
+      ) : null}
+    </div>
+  );
+}
+
 function ProviderDetails({ item }: { item: TaskChatProviderActivityItem }) {
+  if (item.family === "research") return <ResearchDetails item={item} />;
   return (
     <div className="flex min-w-0 flex-col gap-2">
       {item.steps.length > 0 ? (
@@ -78,14 +166,7 @@ function ProviderDetails({ item }: { item: TaskChatProviderActivityItem }) {
         </ul>
       ) : null}
       {item.details.length > 0 ? (
-        <dl className="grid gap-x-3 gap-y-1 sm:grid-cols-(--gtc-2)">
-          {item.details.map((detail) => (
-            <div className="contents" key={`${detail.label}:${detail.value}`}>
-              <dt className="text-muted-foreground">{detail.label}</dt>
-              <dd className={cn("min-w-0 break-words text-foreground", detail.mono && "font-mono")}>{detail.value}</dd>
-            </div>
-          ))}
-        </dl>
+        <DetailList details={item.details} />
       ) : null}
       {item.output ? (
         <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre>
@@ -96,12 +177,15 @@ function ProviderDetails({ item }: { item: TaskChatProviderActivityItem }) {
 }
 
 function WorkspaceChangeDetails({ item }: { item: TaskChatWorkspaceChangeItem }) {
-  return item.files.length > 0 ? (
-    <ul className="flex min-w-0 flex-col gap-2" aria-label="Changed files">
-      {item.files.map((file) => (
-        <li className="flex min-w-0 flex-col gap-1" key={`${file.operation}:${file.path}`}>
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 flex-1 truncate font-mono text-foreground">
+  if (item.files.length === 0) return <p className="text-muted-foreground">No changed-file details were reported.</p>;
+  const visibleFiles = item.files.slice(0, COMPACT_WORKSPACE_FILE_LIMIT);
+  const hiddenFileCount = item.files.length - visibleFiles.length;
+  return (
+    <div className="min-w-0" data-testid="task-chat-workspace-change-details">
+      <ul className="flex min-w-0 flex-col divide-y divide-border/60" aria-label="Changed files">
+        {visibleFiles.map((file) => (
+          <li className="flex min-w-0 items-center gap-2 py-1.5 first:pt-0 last:pb-0" key={`${file.operation}:${file.path}`}>
+            <span className="min-w-0 flex-1 truncate font-mono text-foreground" title={file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}>
               {file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}
             </span>
             <span className="shrink-0 capitalize text-muted-foreground">{file.operation.replaceAll("_", " ")}</span>
@@ -110,12 +194,12 @@ function WorkspaceChangeDetails({ item }: { item: TaskChatWorkspaceChangeItem })
                 {file.additions == null ? "" : `+${file.additions}`} {file.deletions == null ? "" : `−${file.deletions}`}
               </span>
             ) : null}
-          </span>
-          {file.diff ? <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{file.diff}</pre> : null}
-        </li>
-      ))}
-    </ul>
-  ) : <p className="text-muted-foreground">No changed-file details were reported.</p>;
+          </li>
+        ))}
+      </ul>
+      {hiddenFileCount > 0 ? <p className="mt-1.5 text-muted-foreground">{hiddenFileCount} more {hiddenFileCount === 1 ? "file" : "files"} not shown</p> : null}
+    </div>
+  );
 }
 
 function WorkspaceFileDetails({ item }: { item: TaskChatWorkspaceFileItem }) {

@@ -33,7 +33,7 @@ describe("TaskChatProtocolActivityRow", () => {
     ));
   }
 
-  it("renders research as one compact line with expandable sources", () => {
+  it("renders long research results as a bounded readable list", () => {
     const item: TaskChatProviderActivityItem = {
       id: "research",
       kind: "protocol",
@@ -43,9 +43,17 @@ describe("TaskChatProtocolActivityRow", () => {
       status: "completed",
       title: "Research",
       summary: "smoked pork shoulder",
-      details: [{ label: "Query", value: "smoked pork shoulder", mono: true }],
+      details: [
+        { label: "Action", value: "search" },
+        { label: "Status", value: "completed" },
+        { label: "Query", value: "site:nextjs.org/docs/app/api-reference/config/eslint Next.js 16 eslint.config.mjs core-web-vitals typescript", mono: true },
+      ],
       steps: [],
-      links: [{ label: "Smoking guide", href: "https://example.com/smoking", description: "Temperature targets" }],
+      links: Array.from({ length: 6 }, (_, index) => ({
+        label: `Next.js configuration result ${index + 1}`,
+        href: `https://nextjs.org/docs/result-${index + 1}`,
+        description: "A long provider-authored snippet that stays on one compact line in the activity feed.",
+      })),
       children: [],
     };
     render(item);
@@ -62,10 +70,17 @@ describe("TaskChatProtocolActivityRow", () => {
     expect(row?.getAttribute("aria-expanded")).toBe("true");
     const detail = container.querySelector('[data-testid="task-chat-protocol-activity-detail"]');
     expect(detail?.id).toBe(row?.getAttribute("aria-controls"));
-    expect(detail?.textContent).toContain("Smoking guide");
+    expect(detail?.querySelector('[data-testid="task-chat-research-query"]')?.textContent).toContain("eslint.config.mjs");
+    expect(detail?.querySelectorAll('ol[aria-label="Research sources"] li')).toHaveLength(5);
+    expect(detail?.textContent).toContain("Show 1 more result");
+    expect(detail?.textContent).not.toContain("Actionsearch");
+
+    const showMore = Array.from(detail?.querySelectorAll("button") ?? []).find((button) => button.textContent?.includes("Show 1 more result"));
+    act(() => showMore?.click());
+    expect(detail?.querySelectorAll('ol[aria-label="Research sources"] li')).toHaveLength(6);
   });
 
-  it("keeps workspace files and diffs inside the row detail", () => {
+  it("summarizes workspace files without rendering inline diff bodies", () => {
     render({
       id: "workspace",
       kind: "protocol",
@@ -74,16 +89,26 @@ describe("TaskChatProtocolActivityRow", () => {
       revision: 1,
       source: "runner_verified",
       complete: true,
-      files: [{ path: "ui/src/App.tsx", operation: "modify", previousPath: null, additions: 1, deletions: 1, binary: false, diff: "-old\n+new" }],
-      totals: { files: 1, additions: 1, deletions: 1 },
+      files: Array.from({ length: 10 }, (_, index) => ({
+        path: `ui/src/file-${index + 1}.tsx`,
+        operation: "modify" as const,
+        previousPath: null,
+        additions: 1,
+        deletions: 1,
+        binary: false,
+        diff: `-old-${index + 1}\n+new-${index + 1}`,
+      })),
+      totals: { files: 10, additions: 10, deletions: 10 },
       patchArtifactRef: null,
     });
 
     const row = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-protocol-activity-row"] button');
     expect(row?.textContent).toContain("Edited files");
     act(() => row?.click());
-    expect(container.textContent).toContain("ui/src/App.tsx");
-    expect(container.textContent).toContain("+new");
+    expect(container.textContent).toContain("ui/src/file-1.tsx");
+    expect(container.textContent).toContain("2 more files not shown");
+    expect(container.textContent).not.toContain("new-1");
+    expect(container.querySelector('[data-testid="task-chat-workspace-change-details"] pre')).toBeNull();
   });
 
   it("renders durable resources as direct compact links", () => {

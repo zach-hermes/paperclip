@@ -167,9 +167,9 @@ function ProviderActivityCard({ item }: { item: TaskChatProviderActivityItem }) 
             <ChevronDown aria-hidden className="h-3.5 w-3.5" /> Details
           </summary>
           {item.details.length > 0 ? (
-            <dl className="mt-2 grid gap-x-3 gap-y-1 text-xs sm:grid-cols-(--gtc-2)">
+            <dl className="mt-2 flex min-w-0 flex-col gap-1.5 text-xs">
               {item.details.map((detail) => (
-                <div key={`${detail.label}:${detail.value}`} className="contents">
+                <div key={`${detail.label}:${detail.value}`} className="grid min-w-0 grid-cols-1 gap-0.5 sm:grid-cols-(--gtc-task-chat-details) sm:gap-3">
                   <dt className="text-muted-foreground">{detail.label}</dt>
                   <dd className={cn("min-w-0 break-words text-foreground", detail.mono && "font-mono")}>{detail.value}</dd>
                 </div>
